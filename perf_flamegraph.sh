@@ -18,7 +18,7 @@ REPO_ROOT="$(find_repo_root)" || {
     exit 1
 }
 
-RUNS="${RUNS:-30}"
+RUNS="${RUNS:-50}"
 PERF_BIN="${PERF_BIN:-perf}"
 PERF_FREQ="${PERF_FREQ:-997}"
 PERF_EVENT="${PERF_EVENT:-cycles:u}"
@@ -26,7 +26,11 @@ PERF_CALLGRAPH="${PERF_CALLGRAPH:-dwarf,8192}"
 PERF_REPORT_ARGS="${PERF_REPORT_ARGS:---no-inline}"
 PERF_SCRIPT_ARGS="${PERF_SCRIPT_ARGS:---no-inline}"
 PERF_DROP_POLLUTED_STACKS="${PERF_DROP_POLLUTED_STACKS:-1}"
-PERF_MAX_STACK_DEPTH="${PERF_MAX_STACK_DEPTH:-64}"
+PERF_COMM_FILTER="${PERF_COMM_FILTER:-model}"
+PERF_DROP_STARTUP_STACKS="${PERF_DROP_STARTUP_STACKS:-1}"
+PERF_DROP_MODEL_INIT_STACKS="${PERF_DROP_MODEL_INIT_STACKS:-1}"
+PERF_MAX_STACK_DEPTH="${PERF_MAX_STACK_DEPTH:-256}"
+PERF_TRIM_STACK_DEPTH="${PERF_TRIM_STACK_DEPTH:-32}"
 PERF_MAX_UNKNOWN_RUN="${PERF_MAX_UNKNOWN_RUN:-8}"
 BUILD="${BUILD:-1}"
 BUILD_JOBS="${BUILD_JOBS:-10}"
@@ -75,15 +79,20 @@ Environment overrides:
   CONTAINER_RUNTIME                          Container runtime, default: docker
   CONTAINER_EXTRA_ARGS                       Extra args appended to container run
   CASE_DIR                                   Case prefix directory
-  RUNS                                       Loop count, default: 30
+  RUNS                                       Loop count, default: 50
   PERF_BIN                                   perf command, default: perf
   PERF_FREQ                                  perf sampling frequency, default: 997
   PERF_EVENT                                 perf event, default: cycles:u
   PERF_CALLGRAPH                             perf call graph mode, default: dwarf,8192
   PERF_REPORT_ARGS                           Extra perf report args, default: --no-inline
   PERF_SCRIPT_ARGS                           Extra perf script args, default: --no-inline
-  PERF_DROP_POLLUTED_STACKS                  Drop obviously broken folded stacks, default: 1
-  PERF_MAX_STACK_DEPTH                       Dropped stack depth threshold, default: 64
+  PERF_DROP_POLLUTED_STACKS                  Drop/trim polluted folded stacks, default: 1
+  PERF_COMM_FILTER                           Keep only folded stacks whose command matches this value,
+                                             default: model; set empty to disable
+  PERF_DROP_STARTUP_STACKS                   Drop loader/startup/exit folded stacks, default: 1
+  PERF_DROP_MODEL_INIT_STACKS                Drop model initialization/configuration folded stacks, default: 1
+  PERF_MAX_STACK_DEPTH                       Dropped stack depth threshold for broken stacks, default: 256
+  PERF_TRIM_STACK_DEPTH                      Trim displayed folded stack depth, default: 32; set 0 to disable
   PERF_MAX_UNKNOWN_RUN                       Consecutive [unknown] threshold, default: 8
   FLAMEGRAPH_DIR                             Directory containing stackcollapse-perf.pl and flamegraph.pl
   FLAMEGRAPH_REPO                            Repo cloned into tools/FlameGraph when missing
@@ -200,13 +209,24 @@ run_default_profile_build() {
     if ! is_false "${USE_DOCKER_GCC15}"; then
         [[ -f "${DOCKER_GCC15_SCRIPT}" ]] || die "docker-gcc15 script not found: ${DOCKER_GCC15_SCRIPT}"
         echo "[build] docker-gcc15 Profile build: ${PROFILE_BUILD_DIR}"
-        (cd "${REPO_ROOT}" && CONTAINER_MODEL_DIR="${REPO_ROOT}" bash "${DOCKER_GCC15_SCRIPT}" bash -lc "${build_body}")
+        (cd "${REPO_ROOT}" && CONTAINER_MODEL_DIR="${REPO_ROOT}" IMAGE_NAME="${DOCKER_GCC15_IMAGE}" bash "${DOCKER_GCC15_SCRIPT}" bash -lc "${build_body}")
         return 0
     fi
 
     echo "[build] local Profile build: ${PROFILE_BUILD_DIR}"
     (cd "${REPO_ROOT}" && bash -lc "${build_body}")
 }
+
+ensure_default_profile_environment() {
+    if is_false "${USE_DOCKER_GCC15}"; then
+        return 0
+    fi
+
+    [[ -f "${DOCKER_GCC15_SCRIPT}" ]] || die "docker-gcc15 script not found: ${DOCKER_GCC15_SCRIPT}"
+    echo "[build] preparing docker-gcc15 environment"
+    (cd "${REPO_ROOT}" && CONTAINER_MODEL_DIR="${REPO_ROOT}" IMAGE_NAME="${DOCKER_GCC15_IMAGE}" bash "${DOCKER_GCC15_SCRIPT}" true)
+}
+
 build_profile() {
     if is_false "${BUILD}"; then
         echo "[build] skipped"
@@ -214,6 +234,7 @@ build_profile() {
     fi
 
     if profile_build_artifact_exists; then
+        ensure_default_profile_environment
         echo "[build] reusing existing Profile artifact: ${PROFILE_BUILD_DIR}/model"
         return 0
     fi
@@ -275,7 +296,12 @@ write_runner() {
         cat <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+<<<<<<< HEAD
 for i in \$(seq 1 ${runs}); do
+=======
+export LD_LIBRARY_PATH="$(runtime_ld_path | paste -sd: -):\${LD_LIBRARY_PATH:-}"
+for ((i = 1; i <= ${runs}; ++i)); do
+>>>>>>> 21e00e2 (Update tools)
 EOF
         printf '    '
         printf '%q ' "${model_args[@]}"
@@ -298,11 +324,31 @@ filter_folded_stacks() {
     fi
 
     awk \
+        -v comm_filter="${PERF_COMM_FILTER}" \
+        -v drop_startup="${PERF_DROP_STARTUP_STACKS}" \
+        -v drop_model_init="${PERF_DROP_MODEL_INIT_STACKS}" \
         -v max_depth="${PERF_MAX_STACK_DEPTH}" \
+        -v trim_depth="${PERF_TRIM_STACK_DEPTH}" \
         -v max_unknown_run="${PERF_MAX_UNKNOWN_RUN}" '
+        function is_enabled(value) {
+            return value != "" && value != "0" && value != "false" && value != "FALSE" && value != "no" && value != "NO"
+        }
+
         function is_polluted(stack, parts, depth, i, unknown_run) {
             depth = split(stack, parts, ";")
+            if (comm_filter != "" && parts[1] != comm_filter) {
+                return 1
+            }
+
             if (max_depth > 0 && depth > max_depth) {
+                return 1
+            }
+
+            if (is_enabled(drop_startup) && is_startup_stack(stack, parts, depth)) {
+                return 1
+            }
+
+            if (is_enabled(drop_model_init) && is_model_init_stack(stack)) {
                 return 1
             }
 
@@ -321,6 +367,62 @@ filter_folded_stacks() {
             return 0
         }
 
+        function is_startup_stack(stack, parts, depth) {
+            if (depth >= 2 && parts[2] ~ /^_dl_/) {
+                return 1
+            }
+
+            return stack ~ /;_dl_start_user;/ ||
+                stack ~ /;_dl_init;/ ||
+                stack ~ /;call_init[.;]/ ||
+                stack ~ /;_GLOBAL__sub_I_/ ||
+                stack ~ /;exit;__run_exit_handlers;/ ||
+                stack ~ /;_dl_fini;/ ||
+                stack ~ /;_dl_call_fini;/ ||
+                stack ~ /;__cxa_finalize;/
+        }
+
+        function is_model_init_stack(stack) {
+            return stack ~ /;RcmModel::Init;/ ||
+                stack ~ /;sparta::app::CommandLineSimulator::populateSimulation/ ||
+                stack ~ /;sparta::app::Simulation::buildTree;/ ||
+                stack ~ /;TimingModel::RCMSimV2::buildTree_;/ ||
+                stack ~ /;TimingModel::RCMSimV2::initIsaModel_;/ ||
+                stack ~ /;Processor::FuncSim::finalizeConfig;/ ||
+                stack ~ /;sparta::app::ParameterApplicator::/ ||
+                stack ~ /;YAML::/ ||
+                stack ~ /;mavis::parseJSON;/ ||
+                stack ~ /;boost::json::parse;/ ||
+                stack ~ /;ISA_RISCV::Decoder::buildDecoder;/ ||
+                stack ~ /;ISA_RISCV::Decoder::buildDecodeTree;/ ||
+                index(stack, "ISA_RISCV::(anonymous namespace)::buildDecodeTreeNode") > 0 ||
+                index(stack, "ISA_RISCV::(anonymous namespace)::collectPredicateCandidates") > 0 ||
+                index(stack, "ISA_RISCV::(anonymous namespace)::addPredicateCandidate") > 0 ||
+                index(stack, "ISA_RISCV::(anonymous namespace)::scorePredicate") > 0 ||
+                index(stack, "ISA_RISCV::(anonymous namespace)::loadDecoderWeights") > 0 ||
+                index(stack, "TimingModel::InstGenerator::createGenerator") > 0 ||
+                index(stack, "TimingModel::NewSpikeInstGenerator::NewSpikeInstGenerator") > 0 ||
+                index(stack, "TimingModel::NewSpikeInstGenerator::SpikeSimInit") > 0 ||
+                index(stack, "SpikeSimObjSync::init") > 0 ||
+                index(stack, "RawSpike::init") > 0 ||
+                index(stack, "spike_bootstrap") > 0 ||
+                index(stack, "processor_t::build_opcode_map") > 0
+        }
+
+        function trim_stack(stack, parts, depth, i, out) {
+            depth = split(stack, parts, ";")
+            if (trim_depth <= 0 || depth <= trim_depth) {
+                return stack
+            }
+
+            out = parts[1]
+            for (i = depth - trim_depth + 2; i <= depth; i++) {
+                out = out ";" parts[i]
+            }
+            trimmed_lines++
+            return out
+        }
+
         {
             if (match($0, / [0-9]+$/) == 0) {
                 next
@@ -334,13 +436,14 @@ filter_folded_stacks() {
                 next
             }
 
+            stack = trim_stack(stack)
             kept_count += count
-            print
+            print stack " " count
         }
 
         END {
-            printf("[perf] folded filter: dropped_lines=%d dropped_count=%d kept_count=%d\n",
-                dropped_lines, dropped_count, kept_count) > "/dev/stderr"
+            printf("[perf] folded filter: dropped_lines=%d dropped_count=%d kept_count=%d trimmed_lines=%d\n",
+                dropped_lines, dropped_count, kept_count, trimmed_lines) > "/dev/stderr"
         }
     ' "${folded_raw}" > "${folded}"
 }
@@ -416,4 +519,6 @@ main() {
     echo "[done] runner: ${runner}"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
