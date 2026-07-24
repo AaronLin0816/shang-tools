@@ -2,7 +2,21 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+find_repo_root() {
+    local dir="${SCRIPT_DIR}"
+    while [[ "${dir}" != "/" ]]; do
+        if [[ -f "${dir}/CMakeLists.txt" && -x "${dir}/build.sh" ]]; then
+            printf "%s\n" "${dir}"
+            return 0
+        fi
+        dir="$(dirname "${dir}")"
+    done
+    return 1
+}
+REPO_ROOT="$(find_repo_root)" || {
+    echo "error: failed to locate model repository root from ${SCRIPT_DIR}" >&2
+    exit 1
+}
 
 RUNS="${RUNS:-30}"
 PERF_BIN="${PERF_BIN:-perf}"
@@ -18,8 +32,9 @@ BUILD="${BUILD:-1}"
 BUILD_JOBS="${BUILD_JOBS:-10}"
 PROFILE_BUILD_DIR="${PROFILE_BUILD_DIR:-${REPO_ROOT}/profile_build}"
 USE_DOCKER_GCC15="${USE_DOCKER_GCC15:-1}"
-DOCKER_GCC15_SCRIPT="${DOCKER_GCC15_SCRIPT:-${REPO_ROOT}/tools/shang-tools/shang-tools/docker-gcc15.sh}"
-DEFAULT_FLAMEGRAPH_DIR="${REPO_ROOT}/tools/FlameGraph"
+DOCKER_GCC15_SCRIPT="${DOCKER_GCC15_SCRIPT:-${REPO_ROOT}/tools/shang-tools/docker-gcc15.sh}"
+MODEL_TOOLS_DIR="${REPO_ROOT}/tools"
+DEFAULT_FLAMEGRAPH_DIR="${MODEL_TOOLS_DIR}/FlameGraph"
 FLAMEGRAPH_REPO="${FLAMEGRAPH_REPO:-https://github.com/brendangregg/FlameGraph.git}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-docker}"
 CONTAINER_IMAGE="${PROFILE_CONTAINER_IMAGE:-${CONTAINER_IMAGE:-}}"
@@ -97,7 +112,7 @@ ensure_default_flamegraph_dir() {
     fi
 
     command -v git >/dev/null 2>&1 || die "git command not found; cannot clone FlameGraph"
-    mkdir -p "${REPO_ROOT}/tools"
+    mkdir -p "${MODEL_TOOLS_DIR}"
 
     echo "[tools] FlameGraph not found under tools; cloning ${FLAMEGRAPH_REPO}"
     git clone "${FLAMEGRAPH_REPO}" "${DEFAULT_FLAMEGRAPH_DIR}"
