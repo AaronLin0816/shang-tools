@@ -18,10 +18,11 @@ find_repo_root() {
 usage() {
     cat <<EOF
 Usage:
-  $0 <model-relative-test-file>
+  $0 <model-relative-test-file> [model extra args...]
 
 Example:
   $0 model/test/benchmarks/elfs/isa_case/rv64ui/rv64ui-v-lb.riscv
+  $0 model/test/benchmarks/elfs/isa_case/rv64ui/rv64ui-v-ld.riscv --conf arches/json/dfe_dbe_pcache.json
 
 The model output is overwritten to:
   ${SCRIPT_DIR}/log.txt
@@ -33,7 +34,7 @@ die() {
     exit 1
 }
 
-if [[ "$#" -ne 1 ]]; then
+if [[ "$#" -lt 1 ]]; then
     usage >&2
     exit 2
 fi
@@ -41,6 +42,9 @@ fi
 REPO_ROOT="$(find_repo_root)" || die "failed to locate model repository root from ${SCRIPT_DIR}"
 
 case_arg="$1"
+shift
+model_extra_args=("$@")
+
 case "${case_arg}" in
     /*)
         case "${case_arg}" in
@@ -72,6 +76,23 @@ container_model_bin="${container_model_dir}/release/model"
 container_isa_model_yaml="${container_model_dir}/test/benchmarks/isa_model_config/ctest_isa_model.yaml"
 container_isa_model_bin="${container_model_dir}/test/benchmarks/isa_model_config/reset_rom_80000000.bin:0x1000"
 container_test_file="${container_model_dir}/${repo_relative}"
+container_extra_args=()
+for arg in "${model_extra_args[@]}"; do
+    case "${arg}" in
+        "${REPO_ROOT}"/*)
+            container_extra_args+=("${container_model_dir}/${arg#${REPO_ROOT}/}")
+            ;;
+        model/*)
+            container_extra_args+=("${container_model_dir}/${arg#model/}")
+            ;;
+        arches/*|test/*)
+            container_extra_args+=("${container_model_dir}/${arg}")
+            ;;
+        *)
+            container_extra_args+=("${arg}")
+            ;;
+    esac
+done
 container_ld_path="${container_model_dir}/release:${container_model_dir}/release/lib:${container_model_dir}/release/thirdparty/DRAMsim3:${container_model_dir}/release/thirdparty/riscv-isa-sim/lib:${container_model_dir}/release/thirdparty/riscv-isa-sim/interface/spike-prefix/src/spike-build:${container_model_dir}/release/src/isa/isa_model:${container_model_dir}/release/src/app/bpu_sim:${container_model_dir}/release/src/app/cache_sim"
 
 [[ -x "${docker_script}" ]] || die "docker launcher not found or not executable: ${docker_script}"
@@ -94,9 +115,12 @@ set +e
         ' _ \
         "${container_ld_path}" \
         "${container_model_bin}" \
+        "--arch-search-dir=${container_model_dir}/arches" \
+        "--config-search-dir=${container_model_dir}" \
         "--isa-model-yaml=${container_isa_model_yaml}" \
         "--isa-model-bin=${container_isa_model_bin}" \
         "${container_test_file}" \
+        "${container_extra_args[@]}" \
         -l top info 1
 ) > "${log_file}" 2>&1
 status=$?
