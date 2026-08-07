@@ -24,6 +24,10 @@ Example:
   $0 model/test/benchmarks/elfs/isa_case/rv64ui/rv64ui-v-lb.riscv
   $0 model/test/benchmarks/elfs/isa_case/rv64ui/rv64ui-v-ld.riscv --conf arches/json/dfe_dbe_pcache.json
 
+Default cache mode:
+  no --conf                                  -> unified cache (arches/json/arch.json)
+  --conf arches/json/dfe_dbe_pcache.json    -> perfect cache
+
 The model output is overwritten to:
   ${SCRIPT_DIR}/log.txt
 EOF
@@ -40,10 +44,24 @@ if [[ "$#" -lt 1 ]]; then
 fi
 
 REPO_ROOT="$(find_repo_root)" || die "failed to locate model repository root from ${SCRIPT_DIR}"
+DEFAULT_CONF="arches/json/arch.json"
 
 case_arg="$1"
 shift
 model_extra_args=("$@")
+
+has_conf_arg=0
+for arg in "${model_extra_args[@]}"; do
+    case "${arg}" in
+        --conf|--conf=*)
+            has_conf_arg=1
+            break
+            ;;
+    esac
+done
+if [[ "${has_conf_arg}" -eq 0 ]]; then
+    model_extra_args=(--conf "${DEFAULT_CONF}" "${model_extra_args[@]}")
+fi
 
 case "${case_arg}" in
     /*)
